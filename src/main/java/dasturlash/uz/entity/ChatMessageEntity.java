@@ -56,4 +56,11 @@ public class ChatMessageEntity {
     private Boolean isReceiverRead = Boolean.FALSE;
     @Column(name = "visible")
     private Boolean visible = Boolean.TRUE;
+
+//    @Column(name = "chat_id")
+//    private String chatId;
+//    @ManyToOne(fetch = FetchType.LAZY)
+//    @JoinColumn(name = "chat_id", insertable = false, updatable = false)
+//    private ChatEntity chat;
+
 }

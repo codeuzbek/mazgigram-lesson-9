@@ -40,12 +40,26 @@ let selectedChatType = null;
 /** The chat list as returned by the server. Used to fill the chat header. */
 let chatList = [];
 
+/** true when a scroll check is already scheduled for the next animation frame. */
+let isScrollCheckScheduled = false;
+
 /** Timestamp of the last "user is typing" signal we sent. */
 let lastTypingSentAt = 0;
 
 /** Handle of the timer that hides the typing indicator. */
 let typingIndicatorTimer = null;
 
+/** true right after a chat is opened, so we know to scroll to the last read message. */
+let isChatJustOpened = true;
+
+/** true while a history request is in flight — stops duplicate requests. */
+let isLoadingHistory = false;
+
+/**
+ * Describes the last history request we sent, e.g. "chat7|UP|2026-07-30T10:00".
+ * Stops us asking the server for the very same page twice in a row.
+ */
+let lastRequestedCursor = null;
 
 /* =============================================================================
  * 3. DOM REFERENCES
@@ -111,6 +125,10 @@ function registerEventListeners() {
     // (The sidebar is re-rendered often; a listener per item would pile up.)
     chatListContainer.addEventListener('click', onChatListClick);
 
+    // Scrolling the message area loads more history.
+    // `passive: true` tells the browser we never call preventDefault(),
+    // which lets it keep scrolling smoothly.
+    chatMessageContainer.addEventListener('scroll', onChatScroll, {passive: true});
     // ...
 }
 
@@ -328,6 +346,9 @@ function selectChat(chatId, chatType) {
     selectedChatType = chatType;
 
     // Reset the scroll pagination state of the previous chat.
+    lastRequestedCursor = null;
+    isLoadingHistory = false;
+    isChatJustOpened = true;
 
     // Move the 'active' highlight to the clicked item.
     document.querySelectorAll('.chat-item.active')
@@ -359,9 +380,154 @@ function showChatHeader() {
  */
 async function openChat(chatId) {
     chatMessageContainer.innerHTML = '';
+    try {
+        const messages = await loadMessageHistory(chatId, true, 'DOWN');
+
+        // A single short page may not fill the screen, and without a scrollbar
+        // the user can never trigger the next page. Load one more in that case.
+        const isPartiallyFilled = messages && messages.length > 0 && messages.length < PAGE_SIZE * 2;
+        if (isPartiallyFilled) {
+            const oldestLoaded = messages[messages.length - 1];
+            await loadMessageHistory(chatId, false, 'DOWN', oldestLoaded.createdDate, 'beforeend');
+        }
+    } catch (error) {
+        console.error('Could not open the chat:', error);
+    }
 
 }
 
+/* =============================================================================
+ * 9. MESSAGE HISTORY AND INFINITE SCROLL
+ * ========================================================================== */
+
+/**
+ * Asks the server for a page of messages and puts them on screen.
+ *
+ * The server pages by cursor, not by page number: `lmCreatedDate` is the
+ * timestamp of the message we already have at that edge of the list.
+ *
+ * @param {string}  chatId
+ * @param {boolean} justChatOpened  true for the very first page of a chat
+ * @param {string}  scrollDirection 'UP' for older messages, 'DOWN' for newer
+ * @param {string}  lmCreatedDate   timestamp to continue from (null for the first page)
+ * @param {string}  insertPosition  'afterbegin' (on top) or 'beforeend' (at the bottom)
+ * @returns {Promise<Array>} the messages that were loaded
+ */
+async function loadMessageHistory(chatId, justChatOpened = false, scrollDirection = 'UP',
+                                  lmCreatedDate = null, insertPosition = 'beforeend') {
+    const query = new URLSearchParams({
+        scrollDirection: scrollDirection,
+        justChatOpened: justChatOpened,
+        size: PAGE_SIZE
+    });
+
+    const messages = await apiRequest(`/api/v1/chat-message/${chatId}?${query}`, {
+        method: 'POST',
+        body: JSON.stringify({lmCreatedDate: lmCreatedDate})
+    });
+
+    if (!messages) {
+        return [];
+    }
+
+    // The server returns older messages newest-first; flip them so that
+    // inserting with 'afterbegin' keeps the chronological order.
+    if (scrollDirection === 'UP') {
+        messages.reverse();
+    }
+
+    renderMessages(messages, insertPosition);
+
+    // renderMessages() fixes the scroll position on the next animation frame,
+    // so anything that depends on the final position has to wait for it.
+    requestAnimationFrame(() => {
+        if (isChatJustOpened) {
+            isChatJustOpened = false;
+            scrollToLastReadMessage();
+        }
+        // observeUnreadMessages();
+    });
+
+    return messages;
+}
+
+/**
+ * Called on every scroll event.
+ *
+ * Scrolling fires far more often than we could ever load a page, so the real
+ * work is postponed to the next animation frame and repeated events are dropped.
+ */
+function onChatScroll() {
+    if (isScrollCheckScheduled) {
+        return;
+    }
+    isScrollCheckScheduled = true;
+
+    requestAnimationFrame(() => {
+        isScrollCheckScheduled = false;
+        loadMoreMessagesIfNeeded();
+    });
+}
+
+/** Loads the next page when the user has scrolled to the top or the bottom. */
+async function loadMoreMessagesIfNeeded() {
+    if (isLoadingHistory || !selectedChatId) {
+        return;
+    }
+
+    const firstMessage = chatMessageContainer.firstElementChild;
+    const lastMessage = chatMessageContainer.lastElementChild;
+    if (!firstMessage || !lastMessage) {
+        return;
+    }
+
+    // Only one direction can win. In a short chat both the first and the last
+    // message are visible at the same time, and checking them independently
+    // would always end up loading downwards.
+    let scrollDirection;
+    let anchorMessage;
+    if (isElementFullyVisible(firstMessage)) {
+        scrollDirection = 'UP';
+        anchorMessage = firstMessage;
+    } else if (isElementFullyVisible(lastMessage)) {
+        scrollDirection = 'DOWN';
+        anchorMessage = lastMessage;
+    } else {
+        return; // the user is somewhere in the middle
+    }
+
+    const lmCreatedDate = anchorMessage.dataset.createddate;
+
+    // Do not ask for the exact same page twice. This is kept in a variable
+    // rather than on the element so that a failed request can be retried.
+    const cursor = `${selectedChatId}|${scrollDirection}|${lmCreatedDate}`;
+    if (cursor === lastRequestedCursor) {
+        return;
+    }
+
+    isLoadingHistory = true;
+    lastRequestedCursor = cursor;
+    try {
+        await loadMessageHistory(selectedChatId, false, scrollDirection, lmCreatedDate,
+            scrollDirection === 'UP' ? 'afterbegin' : 'beforeend');
+    } catch (error) {
+        console.error('Could not load more messages:', error);
+        lastRequestedCursor = null; // let the next scroll try again
+    } finally {
+        // Must always run: if this stayed true, scrolling would never load again.
+        isLoadingHistory = false;
+    }
+}
+
+/**
+ * @param {Element} element
+ * @returns {boolean} true when the element fits completely inside the message area
+ */
+function isElementFullyVisible(element) {
+    const elementBox = element.getBoundingClientRect();
+    const containerBox = chatMessageContainer.getBoundingClientRect();
+    return elementBox.top >= containerBox.top && elementBox.bottom <= containerBox.bottom;
+}
 
 /* =============================================================================
  * 10. RENDERING MESSAGES
@@ -524,6 +690,16 @@ function updateMessageContent(message) {
 /** Scrolls to the bottom of the message area. */
 function scrollToBottom() {
     chatMessageContainer.scrollTop = chatMessageContainer.scrollHeight;
+}
+
+/** Scrolls to the newest message the user has already read. */
+function scrollToLastReadMessage() {
+    const readMessages = chatMessageContainer.querySelectorAll('.read');
+    if (readMessages.length === 0) {
+        scrollToBottom();
+        return;
+    }
+    readMessages[readMessages.length - 1].scrollIntoView({behavior: 'auto', block: 'end'});
 }
 
 

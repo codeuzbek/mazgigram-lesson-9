@@ -13,4 +13,12 @@ import java.util.List;
 import java.util.Optional;
 
 public interface ChatMessageRepository extends CrudRepository<ChatMessageEntity, String>, PagingAndSortingRepository<ChatMessageEntity, String> {
+
+    @Query("From ChatMessageEntity as c " +
+            " where c.visible = true " +
+            " and c.senderId =:senderId and c.receiverId=:currentProfileId " +
+            " and c.isReceiverRead = true order by  c.createdDate desc limit 1")
+    Optional<ChatMessageEntity> findLastReadMessage_userChat(@Param("currentProfileId") String currentProfileId, @Param("senderId") String senderId);
+
+
 }

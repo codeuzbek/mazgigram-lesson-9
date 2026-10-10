@@ -1,6 +1,7 @@
 package dasturlash.uz.service;
 
 import dasturlash.uz.config.CustomUserDetails;
+import dasturlash.uz.dto.UserGroupWrapper;
 import dasturlash.uz.dto.chat.ChatMessageCreateDTO;
 import dasturlash.uz.dto.chat.ChatMessageDTO;
 import dasturlash.uz.dto.chat.ChatMessageUpdateDTO;
@@ -8,14 +9,21 @@ import dasturlash.uz.dto.profile.ProfileDTO;
 import dasturlash.uz.entity.ChatMessageEntity;
 import dasturlash.uz.entity.ProfileEntity;
 import dasturlash.uz.enums.ChatMessageType;
+import dasturlash.uz.enums.ChatScrollDirection;
 import dasturlash.uz.enums.ChatType;
 import dasturlash.uz.exps.AppBadException;
+import dasturlash.uz.mapper.ChatMessageMapper;
+import dasturlash.uz.repository.ChatMessageCustomRepository;
 import dasturlash.uz.repository.ChatMessageRepository;
 import dasturlash.uz.util.SpringSecurityUtil;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
 
+import java.security.Principal;
 import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
 
 @Service
 public class ChatMessageService {
@@ -27,6 +35,8 @@ public class ChatMessageService {
     private AttachService attachService;
     @Autowired
     private ChatService chatService;
+    @Autowired
+    private ChatMessageCustomRepository chatMessageCustomRepository;
 
     public ChatMessageDTO createChatMessage(ChatMessageCreateDTO dto) {
         CustomUserDetails sender = SpringSecurityUtil.getCurrentProfile();
@@ -125,6 +135,33 @@ public class ChatMessageService {
         // send notification to receiver
         return Boolean.TRUE;
     }
+
+    public List<ChatMessageDTO> getChatMessageHistory(boolean isChatJustOpened,
+                                                      Principal principal,
+                                                      String receiverId,
+                                                      ChatScrollDirection scrollDirection,
+                                                      LocalDateTime lmCreatedDate, int size) {
+        CustomUserDetails currentProfile = (CustomUserDetails) ((Authentication) principal).getPrincipal();
+        String currentProfileId = currentProfile.getId();
+
+        // When chat is just opened, find the last-read message to use as pivot
+        if (isChatJustOpened) {
+            Optional<ChatMessageEntity> lastReadMessage = messageRepository.findLastReadMessage_userChat(currentProfileId, receiverId);
+
+            if (lastReadMessage.isPresent()) { // Oxirgi o'qilgan messagedan tepadagilarini ko'rsatish kerak.
+                lmCreatedDate = lastReadMessage.get().getCreatedDate();
+                scrollDirection = ChatScrollDirection.UP;
+            } else {
+                lmCreatedDate = null;
+                scrollDirection = ChatScrollDirection.NONE;
+            }
+        }
+
+        List<ChatMessageEntity> entityList = chatMessageCustomRepository.getUserChatMessageList(
+                currentProfileId, receiverId, scrollDirection, lmCreatedDate, size);
+        return entityList.stream().map(this::toDTO).toList();
+    }
+
 
     public ChatMessageEntity getById(String id) {
         return messageRepository.findById(id).orElseThrow(() -> {
